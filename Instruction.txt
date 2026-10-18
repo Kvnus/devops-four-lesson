@@ -1,0 +1,232 @@
+
+# Полный сценарий для PostgreSQL (версии 12). Предполагается, что мы работаем с тремя серверами: 
+# master, replica-1 (основная реплика) и replica-2 (реплика с задержкой).
+
+---
+
+1. Настройка мастер-ноды
+
+На мастере вносим правки в postgresql.conf и pg_hba.conf:
+
+```postgresql.conf
+listen_addresses = '*'
+max_connections = 100
+wal_level = replica
+wal_log_hints = on                      
+max_wal_senders = 10
+wal_keep_segments = 64
+hot_standby = on
+max_replication_slots = 10
+wal_keep_size = 1GB
+```
+
+```pg_hba.conf
+# Database administrative login by Unix domain socket
+local   all             postgres                                trust
+
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+
+# "local" is for Unix domain socket connections only
+local   all             all                                     trust
+# IPv4 local connections:
+host    all             all             127.0.0.1/32            trust
+# IPv6 local connections:
+host    all             all             ::1/128                 trust
+# Allow replication connections from localhost, by a user with the
+# replication privilege.
+local   replication     all                                     peer
+host    replication     all             127.0.0.1/32            md5
+host    replication     all             ::1/128                 md5
+#-------------------------------------------------------------------
+host    all             all             136.234.74.145/32       md5
+host    replication     postgres        136.234.74.145/32       md5
+host    all             all             136.234.73.153/32       md5
+host    replication     postgres        136.234.73.153/32       md5
+
+```
+
+# Перестартуем Postgres и проверим слушается ли порт 5432
+
+```bash
+systemctl restart postgresql
+ss -tupln
+
+Netid      State       Recv-Q      Send-Q            Local Address:Port             Peer Address:Port      Process
+udp        UNCONN      0           0                 127.0.0.53%lo:53                    0.0.0.0:*          users:(("systemd-resolve",pid=352,fd=12))
+tcp        LISTEN      0           4096              127.0.0.53%lo:53                    0.0.0.0:*          users:(("systemd-resolve",pid=352,fd=13))
+tcp        LISTEN      0           128                     0.0.0.0:22                    0.0.0.0:*          users:(("sshd",pid=706,fd=3))
+tcp        LISTEN      0           244                     0.0.0.0:5432                  0.0.0.0:*          users:(("postgres",pid=5531,fd=3))
+tcp        LISTEN      0           128                        [::]:22                       [::]:*          users:(("sshd",pid=706,fd=4))
+tcp        LISTEN      0           244                        [::]:5432                     [::]:*          users:(("postgres",pid=5531,fd=4))
+
+```
+
+
+
+# Установим на мастер-ноде пароль в Postgressql пользователю postgres:
+
+```sql
+ALTER ROLE postgres WITH PASSWORD '1qaz2wsx';
+
+```
+---
+
+2. Настройка replica-1 (первая слейв-нода)
+
+Делаем базовый бэкап с мастера:
+
+```bash
+sudo systemctl stop postgresql
+sudo rm -rf /var/lib/postgresql/12/main/*
+sudo -u postgres pg_basebackup -P -R -X stream -c fast -h 136.234.70.128 -U postgres -D /var/lib/postgresql/12/main 
+sudo chown -R postgres:postgres /var/lib/postgresql/12/main/* 
+sudo systemctl start postgresql   
+```
+
+# Флаг -R автоматически создаст standby.signal и пропишет primary_conninfo.
+# Проверка: в pg_stat_replication на мастере должна появиться запись с state = streaming.
+
+---
+
+3. Настройка replica-2 (реплика с отставанием по времени)
+
+Выполняем бэкап как и для первой слейв-ноде:
+
+```bash
+sudo systemctl stop postgresql
+sudo rm -rf /var/lib/postgresql/12/main/*
+sudo -u postgres pg_basebackup -P -R -X stream -c fast -h 136.234.70.128 -U postgres -D /var/lib/postgresql/12/main 
+sudo chown -R postgres:postgres /var/lib/postgresql/12/main/* 
+ 
+```
+
+Добавляем задержку в postgresql.conf на replica-2:
+
+```conf
+recovery_min_apply_delay = 20min   # 20 минут
+```
+
+Или динамически в sql:
+```sql
+postgres=# ALTER SYSTEM SET recovery_min_apply_delay = '20min';
+ALTER SYSTEM
+
+Проверяем:
+postgres=# SELECT pg_reload_conf();
+ pg_reload_conf
+----------------
+ t
+(1 row)
+
+postgres=# SHOW recovery_min_apply_delay;
+ recovery_min_apply_delay
+--------------------------
+ 20min
+(1 row)
+```
+# Стартуем postgresql:
+
+```bash
+sudo systemctl start postgresql
+```
+
+4. Имитация падения мастер-ноды
+
+Остановим PostgreSQL на мастере или выключаем сервер:
+
+```bash
+sudo systemctl stop postgresql
+# или: sudo shutdown -h now
+```
+
+Все реплики останутся в режиме восстановления, ожидая нового мастера.
+
+---
+
+5. Пререводим replica-1 в мастер
+
+На replica-1 выполните:
+
+```bash
+sudo -u postgres /usr/lib/postgresql/12/bin/pg_ctl promote -D /var/lib/postgresql/12/main/
+```
+
+После промоушена replica-1 становится полноценным мастером и принимает запись.
+Надо скорректировать postgresql.conf и pg_hba.conf 
+
+```postgresql.conf
+listen_addresses = '*'
+
+```
+
+```pg_hba.conf
+# Database administrative login by Unix domain socket
+local   all             postgres                                trust
+
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+
+# "local" is for Unix domain socket connections only
+local   all             all                                     trust
+# IPv4 local connections:
+host    all             all             127.0.0.1/32            trust
+# IPv6 local connections:
+host    all             all             ::1/128                 trust
+# Allow replication connections from localhost, by a user with the
+# replication privilege.
+local   replication     all                                     peer
+host    replication     all             127.0.0.1/32            md5
+host    replication     all             ::1/128                 md5
+#-------------------------------------------------------------------
+#host    all             all             136.234.74.145/32       md5
+#host    replication     postgres        136.234.74.145/32       md5
+host    all             all             136.234.73.153/32       md5
+host    replication     postgres        136.234.73.153/32       md5
+
+```
+
+# Перестартуем Postgres и проверим слушается ли порт 5432
+
+```bash
+systemctl restart postgresql
+ss -tupln
+
+Netid      State       Recv-Q      Send-Q            Local Address:Port             Peer Address:Port      Process
+udp        UNCONN      0           0                 127.0.0.53%lo:53                    0.0.0.0:*          users:(("systemd-resolve",pid=352,fd=12))
+tcp        LISTEN      0           4096              127.0.0.53%lo:53                    0.0.0.0:*          users:(("systemd-resolve",pid=352,fd=13))
+tcp        LISTEN      0           128                     0.0.0.0:22                    0.0.0.0:*          users:(("sshd",pid=706,fd=3))
+tcp        LISTEN      0           244                     0.0.0.0:5432                  0.0.0.0:*          users:(("postgres",pid=5531,fd=3))
+tcp        LISTEN      0           128                        [::]:22                       [::]:*          users:(("sshd",pid=706,fd=4))
+tcp        LISTEN      0           244                        [::]:5432                     [::]:*          users:(("postgres",pid=5531,fd=4))
+
+---
+
+6. Снятие задержки с replica-2 и переключение на новый мастер
+
+Шаг 6.1. Убрираем задержку. На replica-2 открываем postgresql.conf и закомментируем или обнулим параметр:
+
+```conf
+# recovery_min_apply_delay = 20min
+```
+
+Шаг 6.2. Переключаем replica-2 на нового мастера (replica-1). Редактируем primary_conninfo в postgresql.auto.conf на replica-2, 
+указав хост нового мастера (replica-1). Можно сделать это через SQL:
+
+```sql
+ALTER SYSTEM SET primary_conninfo = 'host=136.234.74.145 port=5432 user=postgres password=1qaz2wsx';
+ALTER SYSTEM RESET recovery_min_apply_delay;
+SELECT pg_reload_conf();
+```
+
+Либо вручную в postgresql.auto.conf.
+
+Шаг 6.3. Перезапустим replica-2:
+
+```bash
+sudo systemctl restart postgresql
+```
+
+После перезапуска replica-2 догонит replica-1 (нового мастера) и будет работать без задержки. 
+Проверьте на новом мастере: SELECT * FROM pg_stat_replication; — replica-2 должна быть в состоянии streaming.
+
+---
+
